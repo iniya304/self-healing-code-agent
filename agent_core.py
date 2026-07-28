@@ -4,87 +4,114 @@ from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
+from docker_sandbox import execute_code_locally
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-# 1. Define the Agent State
+# 1. State Definition
 class AgentState(TypedDict):
     task: str
     generated_code: str
+    execution_result: str
     error_logs: List[str]
     iteration_count: int
+    max_iterations: int
 
-# 2. Initialize LLM (Groq Llama 3)
+# Initialize LLM
 llm = ChatGroq(
     model_name="llama-3.1-8b-instant",
     temperature=0.1
 )
 
-# 3. Node 1: Code Generator
-def code_generator_node(state: AgentState) -> AgentState:
-    print(f"\n[AGENT] Generating code for task: '{state['task']}'...")
+# 2. Generator Node
+def generator_node(state: AgentState) -> AgentState:
+    print(f"\n🔄 [Iteration {state['iteration_count'] + 1}] Generating/fixing code...")
     
-    prompt = f"""
-    You are an expert Python developer. Write clean, executable Python code for the following task:
-    Task: {state['task']}
-    
-    Return ONLY the executable Python code inside standard Python markdown code blocks (```python ... ```). Do not include conversational explanations.
-    """
+    prompt = f"Task: {state['task']}\n\n"
+    prompt += "Write clean, complete, executable Python code. Include print statements to display output."
     
     if state["error_logs"]:
-        prompt += f"\n\nPrevious Execution Error:\n{state['error_logs'][-1]}\nPlease fix this error in your new output."
+        prompt += f"\n\n⚠️ PREVIOUS CODE FAILED WITH ERROR:\n{state['error_logs'][-1]}"
+        prompt += "\n\nAnalyze the error above and write FIXED Python code."
+
+    prompt += "\n\nReturn ONLY raw executable Python code inside ```python ``` blocks."
 
     response = llm.invoke([
-        SystemMessage(content="You generate production-ready Python code."),
+        SystemMessage(content="You are an expert Python developer. Fix errors precisely when provided."),
         HumanMessage(content=prompt)
     ])
     
-    state["generated_code"] = response.content
+    raw = response.content
+    code = raw.split("```python")[1].split("```")[0].strip() if "```python" in raw else raw.strip()
+    
+    state["generated_code"] = code
     state["iteration_count"] += 1
     return state
 
-# 4. Node 2: Syntax & Code Extractor
-def syntax_validator_node(state: AgentState) -> AgentState:
-    print("[AGENT] Validating code format...")
-    raw_output = state["generated_code"]
+# 3. Execution Sandbox Node
+def executor_node(state: AgentState) -> AgentState:
+    print("⚡ Running code in Execution Sandbox...")
+    code = state["generated_code"]
     
-    if "```python" in raw_output:
-        code = raw_output.split("```python")[1].split("```")[0].strip()
-        state["generated_code"] = code
-    elif "```" in raw_output:
-        code = raw_output.split("```")[1].split("```")[0].strip()
-        state["generated_code"] = code
+    res = execute_code_locally(code)
+    
+    if res["status"] == "success":
+        print("✅ Execution Succeeded!")
+        state["execution_result"] = res["output"]
+    else:
+        print(f"❌ Execution Failed: {res['error']}")
+        state["error_logs"].append(res["error"])
         
     return state
 
-# 5. Build the LangGraph State Machine Workflow
+# 4. Conditional Edge Decision Function
+def decide_next_step(state: AgentState) -> str:
+    if state["execution_result"]:
+        return "end"
+    if state["iteration_count"] >= state["max_iterations"]:
+        print("\n🛑 Reached maximum iteration limit!")
+        return "end"
+    return "retry"
+
+# 5. Build Graph
 workflow = StateGraph(AgentState)
 
-# Add Nodes
-workflow.add_node("generator", code_generator_node)
-workflow.add_node("validator", syntax_validator_node)
+workflow.add_node("generator", generator_node)
+workflow.add_node("executor", executor_node)
 
-# Connect Edges
 workflow.set_entry_point("generator")
-workflow.add_edge("generator", "validator")
-workflow.add_edge("validator", END)
+workflow.add_edge("generator", "executor")
 
-# Compile Graph
-agent_app = workflow.compile()
+workflow.add_conditional_edges(
+    "executor",
+    decide_next_step,
+    {
+        "end": END,
+        "retry": "generator"
+    }
+)
 
-# 6. Test Run
+app = workflow.compile()
+
+# Test with a intentionally tricky prompt or bug scenario
 if __name__ == "__main__":
-    initial_state: AgentState = {
-        "task": "Write a Python function that takes a list of numbers and returns the top 3 highest numbers.",
+    test_task = "Write a function to divide numbers in a list [10, 5, 0, 2] by 2, but intentionally try dividing by zero first or handle ZeroDivisionError correctly."
+    
+    initial_state = {
+        "task": test_task,
         "generated_code": "",
+        "execution_result": "",
         "error_logs": [],
-        "iteration_count": 0
+        "iteration_count": 0,
+        "max_iterations": 3
     }
     
-    result = agent_app.invoke(initial_state)
+    final_output = app.invoke(initial_state)
     
     print("\n" + "="*50)
-    print("FINAL GENERATED CODE:")
+    print("🎯 FINAL EXECUTION OUTPUT:")
     print("="*50)
-    print(result["generated_code"]) 
+    print(final_output["execution_result"])
+    print("\n📜 FINAL WORKING CODE:")
+    print(final_output["generated_code"])
