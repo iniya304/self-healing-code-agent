@@ -1,35 +1,48 @@
 import os
 import ast
+import re
 from typing import TypedDict, List
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
-from docker_sandbox import execute_code_with_tests
+from docker_sandbox import execute_code_with_tests_and_coverage
 
-# Load environment variables
 load_dotenv()
 
-# 1. State Definition
+# Optional: Enable LangSmith Observability if API Key exists
+if os.getenv("LANGCHAIN_API_KEY"):
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_PROJECT"] = "self-healing-code-agent"
+
+# 1. Enhanced State Definition
 class AgentState(TypedDict):
     task: str
     generated_code: str
     generated_tests: str
     ast_valid: bool
     execution_result: str
+    execution_engine: str
+    coverage_score: float
     error_logs: List[str]
     iteration_count: int
     max_iterations: int
 
-# Initialize Groq LLM
 llm = ChatGroq(
     model_name="llama-3.1-8b-instant",
     temperature=0.1
 )
 
-# 2. Generator Node (Writes Code & Pytest Suite)
+# Helper to parse coverage percentage from pytest-cov output
+def extract_coverage(pytest_output: str) -> float:
+    match = re.search(r'TOTAL\s+\d+\s+\d+\s+(\d+)%', pytest_output)
+    if match:
+        return float(match.group(1))
+    return 100.0  # Default if unable to parse
+
+# 2. Generator Node
 def generator_node(state: AgentState) -> AgentState:
-    print(f"\n🔄 [Iteration {state['iteration_count'] + 1}] Generating Solution Code & Pytest Suite...")
+    print(f"\n🔄 [Iteration {state['iteration_count'] + 1}] Generating Code & Pytest Suite...")
     
     prompt = (
         "Task: " + state['task'] + "\n\n"
@@ -43,16 +56,14 @@ def generator_node(state: AgentState) -> AgentState:
     
     if state["error_logs"]:
         prompt += f"\n\n⚠️ PREVIOUS ATTEMPT FAILED WITH ERROR:\n{state['error_logs'][-1]}"
-        prompt += "\n\nAnalyze the error traceback above and fix both code and test suite."
+        prompt += "\n\nFix both code and test suite to pass all tests and reach >80% code coverage."
 
     response = llm.invoke([
-        SystemMessage(content="You are a Principal Software Engineer specializing in Test-Driven Development (TDD)."),
+        SystemMessage(content="You are a Principal AI Software Engineer specializing in Test-Driven Development (TDD) and high test coverage."),
         HumanMessage(content=prompt)
     ])
     
     content = response.content
-    
-    # Parse code and tests based on delimiters
     code_part = ""
     test_part = ""
     
@@ -69,38 +80,38 @@ def generator_node(state: AgentState) -> AgentState:
     state["iteration_count"] += 1
     return state
 
-# 3. AST Static Code Analyzer Node (Pre-execution Syntax Check)
+# 3. AST Static Code Analyzer Node
 def ast_analyzer_node(state: AgentState) -> AgentState:
     print("🔍 [AST Analysis] Performing static syntax check...")
     try:
         ast.parse(state["generated_code"])
         ast.parse(state["generated_tests"])
-        print("✅ AST Check Passed: Valid Python Syntax!")
         state["ast_valid"] = True
     except SyntaxError as e:
         error_msg = f"AST Static Analysis SyntaxError on line {e.lineno}: {e.msg}"
-        print(f"❌ AST Check Failed: {error_msg}")
         state["ast_valid"] = False
         state["error_logs"].append(error_msg)
     except Exception as e:
-        error_msg = f"AST Error: {str(e)}"
         state["ast_valid"] = False
-        state["error_logs"].append(error_msg)
+        state["error_logs"].append(f"AST Error: {str(e)}")
         
     return state
 
-# 4. Sandbox Executor Node (Runs pytest)
+# 4. Sandbox Executor Node (Pytest + Coverage)
 def executor_node(state: AgentState) -> AgentState:
-    print("⚡ Running Pytest Suite in Execution Sandbox...")
-    res = execute_code_with_tests(state["generated_code"], state["generated_tests"])
+    print("⚡ Running Pytest + Coverage in Sandbox...")
+    res = execute_code_with_tests_and_coverage(state["generated_code"], state["generated_tests"])
+    
+    state["execution_engine"] = res["execution_engine"]
     
     if res["status"] == "success":
-        print("✅ Pytest Suite Passed!")
         state["execution_result"] = res["output"]
+        state["coverage_score"] = extract_coverage(res["output"])
+        print(f"✅ Tests Passed with {state['coverage_score']}% Code Coverage!")
     else:
-        print(f"❌ Pytest Execution Failed:\n{res['error']}")
         state["error_logs"].append(res["error"])
         state["execution_result"] = ""
+        state["coverage_score"] = 0.0
         
     return state
 
@@ -113,13 +124,18 @@ def route_after_ast(state: AgentState) -> str:
     return "retry"
 
 def route_after_executor(state: AgentState) -> str:
-    if state["execution_result"]:
+    # Require both successful tests AND >= 70% coverage to pass
+    if state["execution_result"] and state["coverage_score"] >= 70.0:
         return "end"
     if state["iteration_count"] >= state["max_iterations"]:
         return "end"
+    
+    if state["execution_result"] and state["coverage_score"] < 70.0:
+        state["error_logs"].append(f"Low Test Coverage ({state['coverage_score']}%). Minimum 70% required. Add more edge-case unit tests.")
+        
     return "retry"
 
-# 6. Build State Machine Graph
+# 6. State Machine Setup
 workflow = StateGraph(AgentState)
 
 workflow.add_node("generator", generator_node)
@@ -132,19 +148,13 @@ workflow.add_edge("generator", "ast_analyzer")
 workflow.add_conditional_edges(
     "ast_analyzer",
     route_after_ast,
-    {
-        "executor": "executor",
-        "retry": "generator",
-        "end": END
-    }
+    {"executor": "executor", "retry": "generator", "end": END}
 )
 
 workflow.add_conditional_edges(
     "executor",
     route_after_executor,
-    {
-        "end": END,
-        "retry": "generator"
-    }
+    {"end": END, "retry": "generator"}
 )
+
 app = workflow.compile()
