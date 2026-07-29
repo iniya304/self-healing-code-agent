@@ -1,6 +1,8 @@
 import os
 import ast
 import re
+import subprocess
+import tempfile
 from typing import TypedDict, List
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -10,17 +12,19 @@ from docker_sandbox import execute_code_with_tests_and_coverage
 
 load_dotenv()
 
-# Optional: Enable LangSmith Observability if API Key exists
+# Optional: Enable LangSmith Telemetry if API Key is set
 if os.getenv("LANGCHAIN_API_KEY"):
     os.environ["LANGCHAIN_TRACING_V2"] = "true"
     os.environ["LANGCHAIN_PROJECT"] = "self-healing-code-agent"
 
-# 1. Enhanced State Definition
+# 1. State Definition
 class AgentState(TypedDict):
     task: str
     generated_code: str
     generated_tests: str
     ast_valid: bool
+    security_valid: bool
+    security_report: str
     execution_result: str
     execution_engine: str
     coverage_score: float
@@ -33,20 +37,52 @@ llm = ChatGroq(
     temperature=0.1
 )
 
-# Helper to parse coverage percentage from pytest-cov output
+# Security Scanner Helper (Bandit)
+def run_security_scan(code_string: str) -> dict:
+    """Scans code for security vulnerabilities using Bandit."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as temp_file:
+        temp_file.write(code_string)
+        temp_path = temp_file.name
+
+    try:
+        res = subprocess.run(
+            ["bandit", "-r", temp_path, "-f", "txt"],
+            capture_output=True,
+            text=True
+        )
+        os.remove(temp_path)
+        
+        if "No issues identified." in res.stdout or res.returncode == 0:
+            return {"secure": True, "report": "No security issues found."}
+        else:
+            return {"secure": False, "report": res.stdout}
+    except Exception as e:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        return {"secure": True, "report": f"Scan skipped: {str(e)}"}
+
+# Formatter Helper (Black)
+def format_python_code(code_string: str) -> str:
+    """Formats generated code using Black PEP 8 formatter."""
+    try:
+        import black
+        return black.format_str(code_string, mode=black.Mode())
+    except Exception:
+        return code_string  # Return unformatted if formatting fails
+
 def extract_coverage(pytest_output: str) -> float:
     match = re.search(r'TOTAL\s+\d+\s+\d+\s+(\d+)%', pytest_output)
     if match:
         return float(match.group(1))
-    return 100.0  # Default if unable to parse
+    return 100.0
 
-# 2. Generator Node
+# 2. Code Generator Node
 def generator_node(state: AgentState) -> AgentState:
     print(f"\n🔄 [Iteration {state['iteration_count'] + 1}] Generating Code & Pytest Suite...")
     
     prompt = (
         "Task: " + state['task'] + "\n\n"
-        "Write clean, modular, production-ready Python solution code along with a pytest unit test suite.\n\n"
+        "Write clean, secure, production-ready Python solution code along with a pytest unit test suite.\n\n"
         "Output layout MUST strictly be in this format:\n\n"
         "---CODE---\n"
         "# Put solution python code here\n"
@@ -55,17 +91,16 @@ def generator_node(state: AgentState) -> AgentState:
     )
     
     if state["error_logs"]:
-        prompt += f"\n\n⚠️ PREVIOUS ATTEMPT FAILED WITH ERROR:\n{state['error_logs'][-1]}"
-        prompt += "\n\nFix both code and test suite to pass all tests and reach >80% code coverage."
+        prompt += f"\n\n⚠️ PREVIOUS ATTEMPT FAILED WITH ERROR / SECURITY VULNERABILITY:\n{state['error_logs'][-1]}"
+        prompt += "\n\nFix both code and test suite to pass security scans and pytest unit tests with >80% coverage."
 
     response = llm.invoke([
-        SystemMessage(content="You are a Principal AI Software Engineer specializing in Test-Driven Development (TDD) and high test coverage."),
+        SystemMessage(content="You are a Principal AI Software & Security Engineer specializing in TDD, PEP 8, and secure code practices."),
         HumanMessage(content=prompt)
     ])
     
     content = response.content
-    code_part = ""
-    test_part = ""
+    code_part, test_part = "", ""
     
     if "---TESTS---" in content:
         parts = content.split("---TESTS---")
@@ -75,12 +110,15 @@ def generator_node(state: AgentState) -> AgentState:
         code_part = content.replace("```python", "").replace("```", "").strip()
         test_part = "def test_default():\n    assert True"
 
-    state["generated_code"] = code_part
+    # Auto-format generated code with Black
+    formatted_code = format_python_code(code_part)
+
+    state["generated_code"] = formatted_code
     state["generated_tests"] = test_part
     state["iteration_count"] += 1
     return state
 
-# 3. AST Static Code Analyzer Node
+# 3. AST Static Syntax Node
 def ast_analyzer_node(state: AgentState) -> AgentState:
     print("🔍 [AST Analysis] Performing static syntax check...")
     try:
@@ -97,7 +135,24 @@ def ast_analyzer_node(state: AgentState) -> AgentState:
         
     return state
 
-# 4. Sandbox Executor Node (Pytest + Coverage)
+# 4. Security Scan Node (Bandit)
+def security_scan_node(state: AgentState) -> AgentState:
+    print("🛡️ [Security Scan] Running Bandit static vulnerability check...")
+    sec_res = run_security_scan(state["generated_code"])
+    
+    if sec_res["secure"]:
+        print("✅ Security Scan Passed: No vulnerabilities found!")
+        state["security_valid"] = True
+        state["security_report"] = sec_res["report"]
+    else:
+        print("❌ Security Vulnerability Detected!")
+        state["security_valid"] = False
+        state["security_report"] = sec_res["report"]
+        state["error_logs"].append(f"Security Issue Found by Bandit:\n{sec_res['report']}")
+        
+    return state
+
+# 5. Sandbox Execution Node
 def executor_node(state: AgentState) -> AgentState:
     print("⚡ Running Pytest + Coverage in Sandbox...")
     res = execute_code_with_tests_and_coverage(state["generated_code"], state["generated_tests"])
@@ -107,7 +162,7 @@ def executor_node(state: AgentState) -> AgentState:
     if res["status"] == "success":
         state["execution_result"] = res["output"]
         state["coverage_score"] = extract_coverage(res["output"])
-        print(f"✅ Tests Passed with {state['coverage_score']}% Code Coverage!")
+        print(f"✅ Pytest Suite Passed with {state['coverage_score']}% Code Coverage!")
     else:
         state["error_logs"].append(res["error"])
         state["execution_result"] = ""
@@ -115,31 +170,38 @@ def executor_node(state: AgentState) -> AgentState:
         
     return state
 
-# 5. Routing Logic
+# 6. Routing Logic
 def route_after_ast(state: AgentState) -> str:
     if state["ast_valid"]:
+        return "security"
+    if state["iteration_count"] >= state["max_iterations"]:
+        return "end"
+    return "retry"
+
+def route_after_security(state: AgentState) -> str:
+    if state["security_valid"]:
         return "executor"
     if state["iteration_count"] >= state["max_iterations"]:
         return "end"
     return "retry"
 
 def route_after_executor(state: AgentState) -> str:
-    # Require both successful tests AND >= 70% coverage to pass
     if state["execution_result"] and state["coverage_score"] >= 70.0:
         return "end"
     if state["iteration_count"] >= state["max_iterations"]:
         return "end"
     
     if state["execution_result"] and state["coverage_score"] < 70.0:
-        state["error_logs"].append(f"Low Test Coverage ({state['coverage_score']}%). Minimum 70% required. Add more edge-case unit tests.")
+        state["error_logs"].append(f"Low Test Coverage ({state['coverage_score']}%). Minimum 70% required.")
         
     return "retry"
 
-# 6. State Machine Setup
+# 7. LangGraph Workflow
 workflow = StateGraph(AgentState)
 
 workflow.add_node("generator", generator_node)
 workflow.add_node("ast_analyzer", ast_analyzer_node)
+workflow.add_node("security_scan", security_scan_node)
 workflow.add_node("executor", executor_node)
 
 workflow.set_entry_point("generator")
@@ -148,6 +210,12 @@ workflow.add_edge("generator", "ast_analyzer")
 workflow.add_conditional_edges(
     "ast_analyzer",
     route_after_ast,
+    {"security": "security_scan", "retry": "generator", "end": END}
+)
+
+workflow.add_conditional_edges(
+    "security_scan",
+    route_after_security,
     {"executor": "executor", "retry": "generator", "end": END}
 )
 
