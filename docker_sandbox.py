@@ -3,63 +3,72 @@ import sys
 import tempfile
 import os
 
-def execute_code_locally(code_string: str, timeout: int = 5) -> dict:
+def execute_code_with_tests(code_string: str, test_string: str, timeout: int = 10) -> dict:
     """
-    Executes Python code in a safe temporary file environment and captures output or errors.
+    Executes Python code along with generated pytest unit tests in an isolated temporary directory.
     """
-    # Create a temporary python file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
-        temp_file.write(code_string)
-        temp_file_path = temp_file.name
+    # Create a temporary directory for code and test files
+    with tempfile.TemporaryDirectory() as temp_dir:
+        code_file_path = os.path.join(temp_dir, "solution.py")
+        test_file_path = os.path.join(temp_dir, "test_solution.py")
 
-    try:
-        # Run the temporary python script in a separate process
-        result = subprocess.run(
-            [sys.executable, temp_file_path],
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-        
-        # Cleanup temporary file
-        os.remove(temp_file_path)
+        # Write code and tests to files
+        with open(code_file_path, "w", encoding="utf-8") as f:
+            f.write(code_string)
 
-        if result.returncode == 0:
-            return {
-                "status": "success",
-                "output": result.stdout.strip(),
-                "error": None
-            }
-        else:
+        # Prepend import statement so test file can import solution functions
+        full_test_content = f"from solution import *\n\n" + test_string
+        with open(test_file_path, "w", encoding="utf-8") as f:
+            f.write(full_test_content)
+
+        try:
+            # Run pytest in the temporary directory
+            result = subprocess.run(
+                [sys.executable, "-m", "pytest", test_file_path, "-v"],
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+
+            if result.returncode == 0:
+                return {
+                    "status": "success",
+                    "output": result.stdout.strip(),
+                    "error": None
+                }
+            else:
+                return {
+                    "status": "failed",
+                    "output": result.stdout.strip(),
+                    "error": result.stderr.strip() or result.stdout.strip()
+                }
+
+        except subprocess.TimeoutExpired:
             return {
                 "status": "failed",
-                "output": result.stdout.strip(),
-                "error": result.stderr.strip()
+                "output": "",
+                "error": "Execution Timed Out (Possible infinite loop detected in test suite)."
             }
-
-    except subprocess.TimeoutExpired:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        return {
-            "status": "failed",
-            "output": "",
-            "error": "Execution Timed Out (Infinite loop detected)."
-        }
-    except Exception as e:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        return {
-            "status": "error",
-            "output": "",
-            "error": str(e)
-        }
+        except Exception as e:
+            return {
+                "status": "error",
+                "output": "",
+                "error": str(e)
+            }
 
 # Quick Test
 if __name__ == "__main__":
-    test_code = """
-numbers = [12, 45, 7, 23, 56, 89, 34]
-print(sorted(numbers, reverse=True)[:3])
+    sample_code = """
+def add_numbers(a, b):
+    return a + b
 """
-    print("Testing Sandbox Executor...")
-    exec_result = execute_code_locally(test_code)
-    print("Execution Result:", exec_result)
+    sample_test = """
+def test_add_numbers():
+    assert add_numbers(2, 3) == 5
+    assert add_numbers(-1, 1) == 0
+"""
+    print("Testing Sandbox with pytest...")
+    res = execute_code_with_tests(sample_code, sample_test)
+    print("Sandbox Result Status:", res["status"])
+    print("Sandbox Output:\n", res["output"])
